@@ -43,6 +43,48 @@ def build_dylib_lc(path_str):
     lc += b'\x00' * (cmdsize - len(lc))
     return lc
 
+LC_CODE_SIGNATURE = 0x1D
+
+def strip_code_signature(data):
+    """移除 thin arm64 Mach-O 的 LC_CODE_SIGNATURE 并截断签名数据。
+    Apple codesign 会因残留旧签名而报 internal error；剥离后交给 ldid 重签。
+    仅处理单一 thin 64-bit（本项目主程序即是）。返回新的 bytearray。"""
+    magic = struct.unpack_from('<I', data, 0)[0]
+    if magic != MH_MAGIC_64:
+        return data  # 非 thin64，跳过
+    ncmds = struct.unpack_from('<I', data, 16)[0]
+    sizeofcmds = struct.unpack_from('<I', data, 20)[0]
+    off = 32
+    cs_off = None; cs_size = None; lc_pos = None
+    for _ in range(ncmds):
+        cmd, cmdsize = struct.unpack_from('<II', data, off)
+        if cmd == LC_CODE_SIGNATURE:
+            cs_off = off
+            cs_size = cmdsize
+            # linkedit_data_command: cmd cmdsize dataoff datasize
+            sig_dataoff = struct.unpack_from('<I', data, off+8)[0]
+            sig_datasize = struct.unpack_from('<I', data, off+12)[0]
+            lc_pos = (sig_dataoff, sig_datasize)
+        off += cmdsize
+    if cs_off is None:
+        print('  无 LC_CODE_SIGNATURE，跳过剥离')
+        return data
+    # 1) 从 load commands 区删除这条 LC，后续 LC 前移，尾部补零保持区大小
+    lc_region_start = 32
+    lc_region_end = 32 + sizeofcmds
+    before = data[lc_region_start:cs_off]
+    after = data[cs_off+cs_size:lc_region_end]
+    newregion = before + after + b'\x00' * cs_size
+    data[lc_region_start:lc_region_end] = newregion
+    struct.pack_into('<I', data, 16, ncmds - 1)
+    struct.pack_into('<I', data, 20, sizeofcmds - cs_size)
+    # 2) 截断文件末尾的签名数据
+    sig_dataoff, sig_datasize = lc_pos
+    if sig_dataoff and sig_dataoff <= len(data):
+        data = data[:sig_dataoff]
+    print('  已剥离 LC_CODE_SIGNATURE (签名数据 %d 字节已截断)' % sig_datasize)
+    return data
+
 def process_thin(data, offset, path_str):
     """在单个(thin)Mach-O 头处插入 load command。返回修改后的 data。"""
     magic = struct.unpack_from('<I', data, offset)[0]
@@ -137,6 +179,8 @@ def main():
         magic_le = struct.unpack_from('<I', data, 0)[0]
         if magic_le in (MH_MAGIC_64,):
             print('Thin 64-bit Mach-O')
+            # 先剥离旧签名，避免后续 ldid/codesign 因结构不自洽报错
+            data = strip_code_signature(data)
             data = process_thin(data, 0, dylib_path)
         else:
             raise RuntimeError('无法识别的文件格式 magic=%x' % magic_le)

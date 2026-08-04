@@ -72,21 +72,23 @@ jobs:
           PLIST
           fi
 
-      - name: Codesign (ad-hoc) dylib + main + bundle
+      - name: Install ldid
+        run: brew install ldid
+
+      - name: Sign with ldid (dylib + main)
         run: |
           APP=$(ls -d work/Payload/*.app)
           EXE=$(/usr/libexec/PlistBuddy -c "Print :CFBundleExecutable" "$APP/Info.plist")
-          # 1) 先签注入的 dylib
-          codesign --force --sign - --timestamp=none "$APP/KeepAlive.dylib"
-          # 2) 再签被改过的主程序（带原 entitlements），这是"能打开"的关键
-          codesign --force --sign - --timestamp=none \
-            --entitlements ent.plist "$APP/$EXE"
-          # 3) 最后整包深度重签，重建 _CodeSignature/CodeResources
-          codesign --force --deep --sign - --timestamp=none \
-            --entitlements ent.plist "$APP"
-          echo "=== 校验签名 ==="
-          codesign -dv "$APP" 2>&1 || true
-          codesign --verify --deep --verbose=2 "$APP" 2>&1 || true
+          # 用 ldid 做 fakesign（TrollStore 生态标准工具，容忍被改过的 Mach-O）。
+          # 主程序已由 insert_dylib 剥离旧 LC_CODE_SIGNATURE，ldid 重新写入。
+          # 1) 签注入的 dylib
+          ldid -S "$APP/KeepAlive.dylib"
+          # 2) 签被改过的主程序，带原 entitlements（保留 keychain-access-groups 等）
+          ldid -S"ent.plist" "$APP/$EXE"
+          echo "=== 校验主程序 load commands ==="
+          otool -l "$APP/$EXE" | grep -A2 -i "LC_CODE_SIGNATURE\|KeepAlive" || true
+          echo "=== 校验注入项 ==="
+          otool -L "$APP/$EXE" | grep -i keepalive || echo "警告: 未见 KeepAlive 依赖"
 
       - name: Pack IPA
         run: |
