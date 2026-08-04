@@ -1,0 +1,64 @@
+name: Build KeepAlive & Repack IPA
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show SDK
+        run: |
+          xcrun --sdk iphoneos --show-sdk-path
+          clang --version
+
+      - name: Compile KeepAlive.dylib (arm64)
+        run: |
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          clang -arch arm64 \
+            -isysroot "$SDK" \
+            -miphoneos-version-min=12.0 \
+            -dynamiclib \
+            -framework Foundation \
+            -framework UIKit \
+            -framework AVFoundation \
+            -install_name @executable_path/KeepAlive.dylib \
+            -o KeepAlive.dylib \
+            src/KeepAlive.m
+          echo "=== dylib info ==="
+          file KeepAlive.dylib
+          otool -L KeepAlive.dylib || true
+
+      - name: Fakesign dylib (ldid)
+        run: |
+          brew install ldid || true
+          ldid -S KeepAlive.dylib || true
+
+      - name: Generate silence audio
+        run: python3 tools/make_silence.py silence.wav 2
+
+      - name: Locate source IPA
+        id: findipa
+        run: |
+          IPA=$(ls ipa/*.ipa | head -n1)
+          echo "src=$IPA" >> "$GITHUB_OUTPUT"
+          echo "Found: $IPA"
+
+      - name: Repack IPA with keepalive
+        run: |
+          python3 tools/repack.py "${{ steps.findipa.outputs.src }}" \
+            KeepAlive.dylib silence.wav out_keepalive.ipa
+          ls -la out_keepalive.ipa
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: keepalive-ipa
+          path: |
+            out_keepalive.ipa
+            KeepAlive.dylib
