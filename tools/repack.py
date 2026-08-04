@@ -1,16 +1,23 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-重打包 IPA：把编译好的 KeepAlive.dylib 与 silence.wav 装进 App，
-向主程序注入 LC_LOAD_DYLIB，并在 Info.plist 里加 UIBackgroundModes=audio。
-产出新的 *_keepalive.ipa。
+重打包 IPA（分两步，跨平台纯 Python，签名在 CI 的 macOS 上做）。
 
-用法:
-    python repack.py <原始ipa> <KeepAlive.dylib> <silence.wav> <输出ipa>
+子命令:
+  prep <src_ipa> <KeepAlive.dylib> <silence.wav> <work_dir>
+      解包到 <work_dir>，放入 dylib+音频，向主程序注入 LC_LOAD_DYLIB，
+      Info.plist 加 UIBackgroundModes=audio，并导出原 entitlements 到
+      <work_dir>/entitlements.plist（供 codesign 用）。
+      注意：不在此处签名——改过主程序后必须由 macOS 的 codesign 重签整个 app，
+      否则 iOS 加载校验失败，表现为"能装但打不开/闪退"。
 
-跨平台纯 Python，无需 mac 工具链。签名交给 TrollStore 落地时处理。
+  pack <work_dir> <out_ipa>
+      把 <work_dir>/Payload 打包成 IPA（保留目录条目，贴合原始结构）。
+
+单机一步式（仅用于本机结构验证，产物无有效签名、不能真机跑）:
+  repack.py <src_ipa> <dylib> <silence> <out_ipa>
 """
-import sys, os, zipfile, shutil, struct, plistlib, tempfile, subprocess
+import sys, os, zipfile, shutil, plistlib, subprocess
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -31,69 +38,70 @@ def add_background_audio(info_plist_path):
         plistlib.dump(pl, f)
     print('  Info.plist: UIBackgroundModes =', modes)
 
+def prep(src_ipa, dylib, silence, work):
+    if os.path.isdir(work):
+        shutil.rmtree(work)
+    os.makedirs(work)
+    with zipfile.ZipFile(src_ipa) as z:
+        z.extractall(work)
+    payload = os.path.join(work, 'Payload')
+    app = find_app_dir(payload)
+
+    info = os.path.join(app, 'Info.plist')
+    with open(info, 'rb') as f:
+        pl = plistlib.load(f)
+    exe_name = pl['CFBundleExecutable']
+    exe_path = os.path.join(app, exe_name)
+    print('主程序:', exe_name)
+
+    shutil.copy(dylib, os.path.join(app, 'KeepAlive.dylib'))
+    shutil.copy(silence, os.path.join(app, 'silence.wav'))
+    print('  已放入 KeepAlive.dylib + silence.wav')
+
+    subprocess.check_call([sys.executable,
+                           os.path.join(HERE, 'insert_dylib.py'),
+                           '@executable_path/KeepAlive.dylib',
+                           exe_path, exe_path])
+
+    add_background_audio(info)
+    print('  prep 完成，app 目录:', app)
+    print('  下一步需在 macOS 上 codesign 整个 app，再 pack')
+
+def pack(work, out_ipa):
+    payload = os.path.join(work, 'Payload')
+    if os.path.exists(out_ipa):
+        os.remove(out_ipa)
+    with zipfile.ZipFile(out_ipa, 'w', zipfile.ZIP_DEFLATED) as z:
+        zi = zipfile.ZipInfo('Payload/')
+        zi.external_attr = (0o40755 << 16)
+        z.writestr(zi, b'')
+        for root, dirs, files in os.walk(payload):
+            for d in dirs:
+                full = os.path.join(root, d)
+                rel = os.path.relpath(full, work).replace(os.sep, '/') + '/'
+                zi = zipfile.ZipInfo(rel)
+                zi.external_attr = (0o40755 << 16)
+                z.writestr(zi, b'')
+            for fn in files:
+                full = os.path.join(root, fn)
+                rel = os.path.relpath(full, work).replace(os.sep, '/')
+                z.write(full, rel)
+    print('完成 ->', out_ipa)
+
 def main():
-    if len(sys.argv) < 5:
-        print(__doc__); sys.exit(1)
-    src_ipa, dylib, silence, out_ipa = sys.argv[1:5]
-
-    work = tempfile.mkdtemp(prefix='gyx_')
-    try:
-        # 1. 解包
-        with zipfile.ZipFile(src_ipa) as z:
-            z.extractall(work)
-        payload = os.path.join(work, 'Payload')
-        app = find_app_dir(payload)
-        exe_name = None
-
-        info = os.path.join(app, 'Info.plist')
-        with open(info, 'rb') as f:
-            pl = plistlib.load(f)
-        exe_name = pl['CFBundleExecutable']
-        exe_path = os.path.join(app, exe_name)
-        print('主程序:', exe_name)
-
-        # 2. 拷贝保活 dylib + 静音音频进 App
-        shutil.copy(dylib, os.path.join(app, 'KeepAlive.dylib'))
-        shutil.copy(silence, os.path.join(app, 'silence.wav'))
-        print('  已放入 KeepAlive.dylib + silence.wav')
-
-        # 3. 注入 LC_LOAD_DYLIB
-        subprocess.check_call([sys.executable,
-                               os.path.join(HERE, 'insert_dylib.py'),
-                               '@executable_path/KeepAlive.dylib',
-                               exe_path, exe_path])
-
-        # 4. 加后台音频模式
-        add_background_audio(info)
-
-        # 5. 保留原始 _CodeSignature 不动。
-        #    巨魔安装需要包内已有一份可用的签名结构；删掉会导致装不上。
-        #    我们只新增文件 + 注入，签名交给巨魔安装时处理。
-        print('  保留原始 _CodeSignature（巨魔安装需要）')
-
-        # 6. 重新打包 —— 保留目录条目，尽量贴近原始 IPA 结构
-        if os.path.exists(out_ipa):
-            os.remove(out_ipa)
-        with zipfile.ZipFile(out_ipa, 'w', zipfile.ZIP_DEFLATED) as z:
-            # 顶层 Payload/ 目录条目
-            zi = zipfile.ZipInfo('Payload/')
-            zi.external_attr = (0o40755 << 16)
-            z.writestr(zi, b'')
-            for root, dirs, files in os.walk(payload):
-                # 先写目录条目（以 / 结尾），和原始 IPA 一致
-                for d in dirs:
-                    full = os.path.join(root, d)
-                    rel = os.path.relpath(full, work).replace(os.sep, '/') + '/'
-                    zi = zipfile.ZipInfo(rel)
-                    zi.external_attr = (0o40755 << 16)
-                    z.writestr(zi, b'')
-                for fn in files:
-                    full = os.path.join(root, fn)
-                    rel = os.path.relpath(full, work).replace(os.sep, '/')
-                    z.write(full, rel)
-        print('完成 ->', out_ipa)
-    finally:
+    a = sys.argv[1:]
+    if len(a) >= 1 and a[0] == 'prep':
+        prep(a[1], a[2], a[3], a[4]); return
+    if len(a) >= 1 and a[0] == 'pack':
+        pack(a[1], a[2]); return
+    # 兼容旧的一步式（无签名，仅结构验证）
+    if len(a) == 4:
+        work = os.path.abspath('_repack_work')
+        prep(a[0], a[1], a[2], work)
+        pack(work, a[3])
         shutil.rmtree(work, ignore_errors=True)
+        return
+    print(__doc__); sys.exit(1)
 
 if __name__ == '__main__':
     main()

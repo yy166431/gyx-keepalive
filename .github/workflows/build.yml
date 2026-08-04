@@ -30,14 +30,7 @@ jobs:
             -install_name @executable_path/KeepAlive.dylib \
             -o KeepAlive.dylib \
             src/KeepAlive.m
-          echo "=== dylib info ==="
           file KeepAlive.dylib
-          otool -L KeepAlive.dylib || true
-
-      - name: Fakesign dylib (ldid)
-        run: |
-          brew install ldid || true
-          ldid -S KeepAlive.dylib || true
 
       - name: Generate silence audio
         run: python3 tools/make_silence.py silence.wav 2
@@ -49,10 +42,55 @@ jobs:
           echo "src=$IPA" >> "$GITHUB_OUTPUT"
           echo "Found: $IPA"
 
-      - name: Repack IPA with keepalive
+      - name: Prep (unzip + inject + plist)
         run: |
-          python3 tools/repack.py "${{ steps.findipa.outputs.src }}" \
-            KeepAlive.dylib silence.wav out_keepalive.ipa
+          python3 tools/repack.py prep "${{ steps.findipa.outputs.src }}" \
+            KeepAlive.dylib silence.wav work
+          echo "=== app dir ==="
+          ls -la work/Payload/*.app/
+
+      - name: Extract original entitlements
+        run: |
+          APP=$(ls -d work/Payload/*.app)
+          EXE=$(/usr/libexec/PlistBuddy -c "Print :CFBundleExecutable" "$APP/Info.plist")
+          echo "exe=$EXE"
+          # 从原主程序提取 entitlements；失败则用最小 entitlements
+          if codesign -d --entitlements :ent.plist "$APP/$EXE" 2>/dev/null && [ -s ent.plist ]; then
+            echo "已提取原 entitlements:"
+            cat ent.plist
+          else
+            echo "原程序无 entitlements，生成最小集"
+            cat > ent.plist <<'PLIST'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>platform-application</key><true/>
+            <key>com.apple.private.security.no-container</key><true/>
+          </dict>
+          </plist>
+          PLIST
+          fi
+
+      - name: Codesign (ad-hoc) dylib + main + bundle
+        run: |
+          APP=$(ls -d work/Payload/*.app)
+          EXE=$(/usr/libexec/PlistBuddy -c "Print :CFBundleExecutable" "$APP/Info.plist")
+          # 1) 先签注入的 dylib
+          codesign --force --sign - --timestamp=none "$APP/KeepAlive.dylib"
+          # 2) 再签被改过的主程序（带原 entitlements），这是"能打开"的关键
+          codesign --force --sign - --timestamp=none \
+            --entitlements ent.plist "$APP/$EXE"
+          # 3) 最后整包深度重签，重建 _CodeSignature/CodeResources
+          codesign --force --deep --sign - --timestamp=none \
+            --entitlements ent.plist "$APP"
+          echo "=== 校验签名 ==="
+          codesign -dv "$APP" 2>&1 || true
+          codesign --verify --deep --verbose=2 "$APP" 2>&1 || true
+
+      - name: Pack IPA
+        run: |
+          python3 tools/repack.py pack work out_keepalive.ipa
           ls -la out_keepalive.ipa
 
       - name: Upload artifacts
