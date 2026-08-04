@@ -1,34 +1,27 @@
 # gyx-keepalive
 
-给侧载/TrollStore 版 App 加「静音音频后台保活」，解决进后台被 iOS 挂起导致
-注入 dylib（流量重定向 / 授权 / 定时器）停止工作、「掉后台掉效果」的问题。
+后台保活 dylib，供 **TrollFools 外部注入**到巨魔安装的原版 App，解决进后台
+被 iOS 挂起导致注入的业务逻辑（流量重定向/定时器）停摆、"掉后台掉效果"。
+
+## 用法（推荐路线：原版巨魔装 + TrollFools 注入）
+
+1. 用巨魔(TrollStore)正常安装**原版 IPA**（能装、能打开）。
+2. GitHub Actions 跑完，从 `KeepAlive-dylib` 工件下载 `KeepAlive.dylib`。
+3. 打开 **TrollFools** → 选中该 App → 注入插件 → 选 `KeepAlive.dylib` → 应用。
+4. 重开 App 即生效。测试：进 App 停留几秒 → 回桌面/锁屏 → 数分钟后看效果还在不在。
 
 ## 原理
 
-iOS 不给普通第三方 App 真正的后台执行权。可用的稳定手段是声明
-`UIBackgroundModes=audio` 并在进程内持续播放一段无声音频，让系统以为在放音乐
-而不挂起进程，从而让 App 内其他逻辑持续运行。
+- dylib 被注入后，constructor 自启，运行时激活 AVAudioSession(playback+
+  mixWithOthers) 并循环播放**代码内构造的静音 PCM**（无外部文件、不改 Info.plist）。
+- 巨魔 App 经 TrollFools 重签带高权限，运行时激活音频通常无需 plist 的 audio 声明。
+- 进后台 beginBackgroundTask 续期 + 10s 守护定时器确保音频不断。
+- 监听中断/路由/前后台切换自动恢复。
 
-**非 100%**：锁屏久了、系统内存告急仍可能被回收。这是 iOS 的硬限制。
+**非 100%**：iOS 硬限制，锁屏久/内存告急仍可能被回收；mixWithOthers 已尽量不吵别的 App。
 
-## 组成
+## 文件
 
-- `src/KeepAlive.m` — 保活 dylib 源码：constructor 自启，AVAudioPlayer 无限循环
-  播放静音，监听中断/路由变化自动恢复，进后台申请 backgroundTask。
-- `tools/insert_dylib.py` — 纯 Python 向主程序追加 `LC_LOAD_DYLIB`（跨平台，无需 mac）。
-- `tools/make_silence.py` — 生成静音 WAV。
-- `tools/repack.py` — 解包 IPA → 放入 dylib+音频 → 注入 → 加后台模式 → 重打包。
-- `.github/workflows/build.yml` — macOS runner 编译 arm64 dylib 并重打包，产出
-  `out_keepalive.ipa` 工件。
-
-## 用法
-
-1. 原始 IPA 放在 `ipa/`（当前为 `ipa/source.ipa`）。
-2. push 到 GitHub 触发 Actions，或手动 `workflow_dispatch`。
-3. 下载 `keepalive-ipa` 工件里的 `out_keepalive.ipa`。
-4. 用 TrollStore 安装（落地自动 fakesign + 注入 entitlements）。
-
-## 说明
-
-- 原有注入的业务 dylib（`刺客fuck.dylib`）保持不动，仅新增保活模块。
-- 重打包会删除旧 `_CodeSignature`，由 TrollStore 重签。
+- `src/KeepAlive.m` — 保活 dylib 源码（纯注入自洽，无外部依赖）。
+- `.github/workflows/build.yml` — macOS runner 编 arm64 + ldid 签名，产出 `KeepAlive.dylib`。
+- `tools/` — 早期重打包方案的脚本（insert_dylib/repack/make_silence），当前路线用不到，保留备用。

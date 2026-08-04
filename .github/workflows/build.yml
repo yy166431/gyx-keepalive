@@ -1,4 +1,4 @@
-name: Build KeepAlive & Repack IPA
+name: Build KeepAlive dylib (for TrollFools)
 
 on:
   push:
@@ -30,75 +30,19 @@ jobs:
             -install_name @executable_path/KeepAlive.dylib \
             -o KeepAlive.dylib \
             src/KeepAlive.m
+          echo "=== dylib info ==="
           file KeepAlive.dylib
+          otool -L KeepAlive.dylib
 
-      - name: Generate silence audio
-        run: python3 tools/make_silence.py silence.wav 2
-
-      - name: Locate source IPA
-        id: findipa
+      - name: Sign dylib (ldid)
         run: |
-          IPA=$(ls ipa/*.ipa | head -n1)
-          echo "src=$IPA" >> "$GITHUB_OUTPUT"
-          echo "Found: $IPA"
+          brew install ldid
+          ldid -S KeepAlive.dylib
+          echo "=== signed ==="
+          codesign -dv KeepAlive.dylib 2>&1 || true
 
-      - name: Prep (unzip + inject + plist)
-        run: |
-          python3 tools/repack.py prep "${{ steps.findipa.outputs.src }}" \
-            KeepAlive.dylib silence.wav work
-          echo "=== app dir ==="
-          ls -la work/Payload/*.app/
-
-      - name: Extract original entitlements
-        run: |
-          APP=$(ls -d work/Payload/*.app)
-          EXE=$(/usr/libexec/PlistBuddy -c "Print :CFBundleExecutable" "$APP/Info.plist")
-          echo "exe=$EXE"
-          # 从原主程序提取 entitlements；失败则用最小 entitlements
-          if codesign -d --entitlements :ent.plist "$APP/$EXE" 2>/dev/null && [ -s ent.plist ]; then
-            echo "已提取原 entitlements:"
-            cat ent.plist
-          else
-            echo "原程序无 entitlements，生成最小集"
-            cat > ent.plist <<'PLIST'
-          <?xml version="1.0" encoding="UTF-8"?>
-          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-          <plist version="1.0">
-          <dict>
-            <key>platform-application</key><true/>
-            <key>com.apple.private.security.no-container</key><true/>
-          </dict>
-          </plist>
-          PLIST
-          fi
-
-      - name: Install ldid
-        run: brew install ldid
-
-      - name: Sign with ldid (dylib + main)
-        run: |
-          APP=$(ls -d work/Payload/*.app)
-          EXE=$(/usr/libexec/PlistBuddy -c "Print :CFBundleExecutable" "$APP/Info.plist")
-          # 用 ldid 做 fakesign（TrollStore 生态标准工具，容忍被改过的 Mach-O）。
-          # 主程序已由 insert_dylib 剥离旧 LC_CODE_SIGNATURE，ldid 重新写入。
-          # 1) 签注入的 dylib
-          ldid -S "$APP/KeepAlive.dylib"
-          # 2) 签被改过的主程序，带原 entitlements（保留 keychain-access-groups 等）
-          ldid -S"ent.plist" "$APP/$EXE"
-          echo "=== 校验主程序 load commands ==="
-          otool -l "$APP/$EXE" | grep -A2 -i "LC_CODE_SIGNATURE\|KeepAlive" || true
-          echo "=== 校验注入项 ==="
-          otool -L "$APP/$EXE" | grep -i keepalive || echo "警告: 未见 KeepAlive 依赖"
-
-      - name: Pack IPA
-        run: |
-          python3 tools/repack.py pack work out_keepalive.ipa
-          ls -la out_keepalive.ipa
-
-      - name: Upload artifacts
+      - name: Upload dylib
         uses: actions/upload-artifact@v4
         with:
-          name: keepalive-ipa
-          path: |
-            out_keepalive.ipa
-            KeepAlive.dylib
+          name: KeepAlive-dylib
+          path: KeepAlive.dylib
