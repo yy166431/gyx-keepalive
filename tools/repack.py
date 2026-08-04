@@ -66,21 +66,31 @@ def main():
         # 4. 加后台音频模式
         add_background_audio(info)
 
-        # 5. 删除旧签名（TrollStore 会重签），避免签名不一致
-        cs = os.path.join(app, '_CodeSignature')
-        if os.path.isdir(cs):
-            shutil.rmtree(cs)
-            print('  已移除旧 _CodeSignature（TrollStore 落地会重签）')
+        # 5. 保留原始 _CodeSignature 不动。
+        #    巨魔安装需要包内已有一份可用的签名结构；删掉会导致装不上。
+        #    我们只新增文件 + 注入，签名交给巨魔安装时处理。
+        print('  保留原始 _CodeSignature（巨魔安装需要）')
 
-        # 6. 重新打包
+        # 6. 重新打包 —— 保留目录条目，尽量贴近原始 IPA 结构
         if os.path.exists(out_ipa):
             os.remove(out_ipa)
         with zipfile.ZipFile(out_ipa, 'w', zipfile.ZIP_DEFLATED) as z:
-            for root, _, files in os.walk(payload):
+            # 顶层 Payload/ 目录条目
+            zi = zipfile.ZipInfo('Payload/')
+            zi.external_attr = (0o40755 << 16)
+            z.writestr(zi, b'')
+            for root, dirs, files in os.walk(payload):
+                # 先写目录条目（以 / 结尾），和原始 IPA 一致
+                for d in dirs:
+                    full = os.path.join(root, d)
+                    rel = os.path.relpath(full, work).replace(os.sep, '/') + '/'
+                    zi = zipfile.ZipInfo(rel)
+                    zi.external_attr = (0o40755 << 16)
+                    z.writestr(zi, b'')
                 for fn in files:
                     full = os.path.join(root, fn)
-                    rel = os.path.relpath(full, work)
-                    z.write(full, rel.replace(os.sep, '/'))
+                    rel = os.path.relpath(full, work).replace(os.sep, '/')
+                    z.write(full, rel)
         print('完成 ->', out_ipa)
     finally:
         shutil.rmtree(work, ignore_errors=True)
